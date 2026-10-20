@@ -50,12 +50,11 @@ Sur une copie neuve d'AdventureWorksDW, exécuter dans l'ordre :
 | `02_schema.sql` | C | Schémas `tdw` et `tdw_scd2`, tables, contraintes, déclencheurs anti-chevauchement (bonus) | crée les tables |
 | `03_chargement.sql` | C | Chargement initial (C2), table de faits sur clés stables (C3), copies SCD 2 (C4) | charge les tables |
 | `04_scenario.sql` | D | Scénario fourni, **non modifié** — **une seule fois** | applique les 4 événements |
-| `05_requetes.sql` | E | R1, R2, R3 (TDW et SCD 2), R4, R5 (TDW) ; bonus R6, R7, R8 | non (crée `dbo.MaxDate`, `dbo.MinDate`) |
+| `05_requetes.sql` | E | R1, R2, R3 (TDW et SCD 2), R4, R5 (TDW) ; bonus R6, R7, R8, B1, B2 | non pour `dbo`, `tdw`, `tdw_scd2` (crée `dbo.MaxDate`, `dbo.MinDate` ; B1/B2 écrivent uniquement dans le schéma `bonus`) |
 | `06_mesures.sql` | F2 | Temps d'exécution de R1 à R3, sans puis avec index | non (crée des index) |
 | `07_tests.sql` | F1 | Tests de validation 1 à 5 | non |
-| `08_bonus_B1_B2.sql` | bonus | B1 (table temporelle système) et B2 (24 changements de prix) dans un schéma `bonus` | uniquement le schéma `bonus` |
 
-`05`, `06`, `07` et `08` sont indépendants entre eux (seuls `02` → `03` → `04` sont requis avant).
+`05`, `06` et `07` sont indépendants entre eux (seuls `02` → `03` → `04` sont requis avant).
 
 **Rejouer le scénario.** `04_scenario.sql` refuse de s'exécuter deux fois. Relancer `02` (qui supprime
 tout, y compris `tdw.ScenarioJournal`), puis `03` et `04`.
@@ -64,7 +63,7 @@ tout, y compris `tdw.ScenarioJournal`), puis `03` et `04`.
 
 ```bash
 export SQLCMDPASSWORD='...'
-for f in 01_inventaire 02_schema 03_chargement 04_scenario 05_requetes 06_mesures 07_tests 08_bonus_B1_B2; do
+for f in 01_inventaire 02_schema 03_chargement 04_scenario 05_requetes 06_mesures 07_tests; do
   sqlcmd -S localhost -U sa -C -d AdventureWorksDW2019 -i $f.sql -o sonuclar/$f.txt -W -s"|"
 done
 ```
@@ -146,7 +145,7 @@ Les 7 contrôles renvoient **OK** : 1 (faits identiques à la source), 2 (aucun 
 3 (synchronisation), 4 (somme annuelle de R1 = CA de l'année), 5-R1, 5-R2, 5-R3 (EXCEPT dans les deux
 sens). Contrôle de sens : R1 et R2 diffèrent sur exactement 4 lignes.
 
-### Bonus (`05` et `08`)
+### Bonus (`05`)
 
 - **R6** : 9 produits, 12 périodes avant coalescing, 9 après ; total inchangé (803 110,08).
 - **R7** (2012) : le sommet de la hiérarchie (Ken Sánchez, Brian Welcker) cumule exactement le CA de
@@ -177,6 +176,9 @@ sens). Contrôle de sens : R1 et R2 diffèrent sur exactement 4 lignes.
 - **R2 / R3 en SCD 2.** Version courante = `EndDate IS NULL`, à défaut la plus récente (même règle que
   C2) ; version à une date = celle dont l'intervalle fermé contient la date, à défaut la plus ancienne.
   Sans ces règles, les ventes des produits sans version courante disparaîtraient du résultat.
+  La règle de repli de R3 s'applique à la plupart des produits : les intervalles de `dbo.DimProduct`
+  sont incohérents (`StartDate` décalées mais pas `EndDate`, d'où `EndDate < StartDate` ; requête B4 :
+  48 954 ventes sur 60 855 hors de la validité de leur version).
 - **Comparaison des modèles.** Regroupement par `ProductSubcategoryKey` et non par le nom (le
   renommage de @t3 n'existe que dans le modèle TDW).
 - **Coalescing** (absent de l'article). Fonctions de fenêtrage : une période ouvre un nouveau groupe si
