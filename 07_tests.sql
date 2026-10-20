@@ -1,10 +1,14 @@
 /* =====================================================================
    07_tests.sql  —  Étape F1 : tests de validation
 
-   À exécuter après 02 → 03 → 04 (et indépendamment de 05).
-   Chaque test renvoie zéro ligne d'anomalie, ou vérifie une égalité.
-   Un tableau récapitulatif final indique OK / ÉCHEC pour chaque test ;
-   en cas d'échec, les lignes fautives sont affichées juste avant.
+   À exécuter après 02 → 03 → 04 (indépendant de 05 et 06).
+
+   Une requête par test. Chaque test renvoie ZÉRO LIGNE (aucune anomalie)
+   ou une ÉGALITÉ VÉRIFIÉE (test 1). Le résultat attendu est indiqué
+   au-dessus de chaque requête.
+
+   Après chaque test, le nombre de lignes renvoyées est noté
+   (@@ROWCOUNT) ; un tableau récapitulatif OK / ÉCHEC est affiché à la fin.
    ===================================================================== */
 
 SET NOCOUNT ON;
@@ -12,35 +16,43 @@ GO
 
 IF OBJECT_ID('tempdb..#Resultats') IS NOT NULL DROP TABLE #Resultats;
 CREATE TABLE #Resultats (
-    Test     NVARCHAR(10)  NOT NULL,
-    Libelle  NVARCHAR(200) NOT NULL,
-    Anomalies INT          NOT NULL,
-    Resultat AS (CASE WHEN Anomalies = 0 THEN N'OK' ELSE N'ÉCHEC' END)
+    Test      NVARCHAR(10)  NOT NULL,
+    Libelle   NVARCHAR(200) NOT NULL,
+    Anomalies INT           NOT NULL,
+    Resultat  AS (CASE WHEN Anomalies = 0 THEN N'OK' ELSE N'ÉCHEC' END)
 );
 GO
 
 /* =====================================================================
    Test 1 — tdw.Ventes a le même nombre de lignes et la même somme de
    SalesAmount que dbo.FactResellerSales.
+   Attendu : 1 ligne, Resultat = OK (égalité vérifiée).
    ===================================================================== */
-DECLARE @nSrc INT, @nTdw INT, @sSrc MONEY, @sTdw MONEY;
-SELECT @nSrc = COUNT(*), @sSrc = SUM(SalesAmount) FROM dbo.FactResellerSales;
-SELECT @nTdw = COUNT(*), @sTdw = SUM(SalesAmount) FROM tdw.Ventes;
-
-SELECT N'Test 1' AS Test, @nSrc AS NbLignesSource, @nTdw AS NbLignesTdw,
-       @sSrc AS SommeSource, @sTdw AS SommeTdw;
+SELECT N'Test 1' AS Test,
+       s.NbLignes AS NbLignesSource, t.NbLignes AS NbLignesTdw,
+       s.Somme    AS SommeSource,    t.Somme    AS SommeTdw,
+       CASE WHEN s.NbLignes = t.NbLignes AND s.Somme = t.Somme
+            THEN N'OK' ELSE N'ÉCHEC' END AS Resultat
+FROM      (SELECT COUNT(*) AS NbLignes, SUM(SalesAmount) AS Somme FROM dbo.FactResellerSales) AS s
+CROSS JOIN (SELECT COUNT(*) AS NbLignes, SUM(SalesAmount) AS Somme FROM tdw.Ventes)          AS t;
 
 INSERT INTO #Resultats (Test, Libelle, Anomalies)
-VALUES (N'1', N'tdw.Ventes = dbo.FactResellerSales (lignes et somme)',
-        CASE WHEN @nSrc = @nTdw AND @sSrc = @sTdw THEN 0 ELSE 1 END);
+SELECT N'1', N'tdw.Ventes = dbo.FactResellerSales (lignes et somme)',
+       CASE WHEN (SELECT COUNT(*) FROM dbo.FactResellerSales) = (SELECT COUNT(*) FROM tdw.Ventes)
+             AND (SELECT SUM(SalesAmount) FROM dbo.FactResellerSales) = (SELECT SUM(SalesAmount) FROM tdw.Ventes)
+            THEN 0 ELSE 1 END;
 GO
 
 /* =====================================================================
    Test 2 — Aucune table temporelle ne contient deux intervalles qui se
    chevauchent pour un même membre.
-   Deux intervalles [a.From, a.To) et [b.From, b.To) d'un même membre se
-   chevauchent ssi a.From < b.To ET b.From < a.To (a et b distincts).
+   [a.From, a.To) et [b.From, b.To) se chevauchent ssi l'un commence
+   avant la fin de l'autre ; FromDate étant unique par membre (clé
+   primaire), on teste a.FromDate < b.FromDate < a.ToDate.
+   Attendu : 0 ligne.
    ===================================================================== */
+DECLARE @n INT;
+
 WITH Intervalles AS (
     SELECT N'ProduitDureeVie'      AS TableTemporelle, ProduitKey            AS Membre, FromDate, ToDate FROM tdw.ProduitDureeVie
     UNION ALL
@@ -57,60 +69,92 @@ WITH Intervalles AS (
 SELECT a.TableTemporelle, a.Membre,
        a.FromDate AS FromA, a.ToDate AS ToA,
        b.FromDate AS FromB, b.ToDate AS ToB
-INTO   #Chevauchements
 FROM   Intervalles AS a
 JOIN   Intervalles AS b
        ON  b.TableTemporelle = a.TableTemporelle
        AND b.Membre = a.Membre
-       AND a.FromDate < b.FromDate          -- chaque paire une seule fois (FromDate unique par membre : PK)
-       AND b.FromDate < a.ToDate;           -- b commence avant la fin de a → chevauchement
-
-IF EXISTS (SELECT 1 FROM #Chevauchements)
-    SELECT N'Test 2 — chevauchements' AS Test, * FROM #Chevauchements;
+       AND a.FromDate < b.FromDate
+       AND b.FromDate < a.ToDate;
+SET @n = @@ROWCOUNT;
 
 INSERT INTO #Resultats (Test, Libelle, Anomalies)
-SELECT N'2', N'Aucun chevauchement d''intervalles dans les 6 tables temporelles', COUNT(*)
-FROM   #Chevauchements;
-
-DROP TABLE #Chevauchements;
+VALUES (N'2', N'Aucun chevauchement d''intervalles dans les 6 tables temporelles', @n);
 GO
 
 /* =====================================================================
    Test 3 — Contrainte de synchronisation (p. 128) : chaque vente tombe
    dans la durée de vie de son produit, et le produit a une
    sous-catégorie valide à la date de la vente.
+   Attendu : 0 ligne.
    ===================================================================== */
+DECLARE @n INT;
+
 SELECT v.SalesOrderNumber, v.SalesOrderLineNumber, v.ProduitKey,
        d.FullDateAlternateKey AS DateVente,
        CASE WHEN NOT EXISTS (SELECT 1 FROM tdw.ProduitDureeVie AS l
                              WHERE  l.ProduitKey = v.ProduitKey
                                AND  l.FromDate <= d.FullDateAlternateKey
                                AND  d.FullDateAlternateKey < l.ToDate)
-            THEN 1 ELSE 0 END AS HorsDureeVie,
-       CASE WHEN NOT EXISTS (SELECT 1 FROM tdw.ProduitSousCategorie AS ps
-                             WHERE  ps.ProduitKey = v.ProduitKey
-                               AND  ps.FromDate <= d.FullDateAlternateKey
-                               AND  d.FullDateAlternateKey < ps.ToDate)
-            THEN 1 ELSE 0 END AS SansSousCategorie
-INTO   #Synchro
+            THEN N'hors durée de vie' ELSE N'sans sous-catégorie valide' END AS Anomalie
 FROM   tdw.Ventes  AS v
-JOIN   dbo.DimDate AS d ON d.DateKey = v.OrderDateKey;
-
-DELETE FROM #Synchro WHERE HorsDureeVie = 0 AND SansSousCategorie = 0;
-
-IF EXISTS (SELECT 1 FROM #Synchro)
-    SELECT TOP (50) N'Test 3 — ventes non synchronisées' AS Test, * FROM #Synchro;
+JOIN   dbo.DimDate AS d ON d.DateKey = v.OrderDateKey
+WHERE  NOT EXISTS (SELECT 1 FROM tdw.ProduitDureeVie AS l
+                   WHERE  l.ProduitKey = v.ProduitKey
+                     AND  l.FromDate <= d.FullDateAlternateKey
+                     AND  d.FullDateAlternateKey < l.ToDate)
+   OR  NOT EXISTS (SELECT 1 FROM tdw.ProduitSousCategorie AS ps
+                   WHERE  ps.ProduitKey = v.ProduitKey
+                     AND  ps.FromDate <= d.FullDateAlternateKey
+                     AND  d.FullDateAlternateKey < ps.ToDate);
+SET @n = @@ROWCOUNT;
 
 INSERT INTO #Resultats (Test, Libelle, Anomalies)
-SELECT N'3', N'Synchronisation : vente dans la durée de vie, sous-catégorie valide à la date', COUNT(*)
-FROM   #Synchro;
-
-DROP TABLE #Synchro;
+VALUES (N'3', N'Synchronisation : vente dans la durée de vie, sous-catégorie valide à la date', @n);
 GO
 
 /* =====================================================================
-   Requêtes R1, R2, R3 matérialisées pour les tests 4 et 5
-   (même logique que 05_requetes.sql, sans les colonnes d'affichage)
+   Test 4 — Pour chaque année, la somme des lignes de R1 (TDW) est égale
+   au chiffre d'affaires total de l'année. Un oubli de la condition
+   temporelle compterait certaines ventes deux fois ; une vente sans
+   sous-catégorie valide disparaîtrait.
+   Attendu : 0 ligne (aucune année en écart).
+   ===================================================================== */
+DECLARE @n INT;
+
+WITH R1 AS (
+    SELECT ps.ProductSubcategoryKey, d.CalendarYear AS Annee, SUM(v.SalesAmount) AS ChiffreAffaires
+    FROM   tdw.Ventes AS v
+    JOIN   dbo.DimDate AS d ON d.DateKey = v.OrderDateKey
+    JOIN   tdw.ProduitSousCategorie AS ps
+           ON  ps.ProduitKey = v.ProduitKey
+           AND ps.FromDate <= d.FullDateAlternateKey
+           AND d.FullDateAlternateKey < ps.ToDate
+    GROUP BY ps.ProductSubcategoryKey, d.CalendarYear
+),
+SommeR1 AS (
+    SELECT Annee, SUM(ChiffreAffaires) AS SommeR1 FROM R1 GROUP BY Annee
+),
+CAAnnee AS (
+    SELECT d.CalendarYear AS Annee, SUM(f.SalesAmount) AS CAAnnee
+    FROM   dbo.FactResellerSales AS f
+    JOIN   dbo.DimDate AS d ON d.DateKey = f.OrderDateKey
+    GROUP BY d.CalendarYear
+)
+SELECT COALESCE(c.Annee, r.Annee) AS Annee, c.CAAnnee, r.SommeR1,
+       ISNULL(c.CAAnnee, 0) - ISNULL(r.SommeR1, 0) AS Ecart
+FROM   CAAnnee AS c
+FULL OUTER JOIN SommeR1 AS r ON r.Annee = c.Annee
+WHERE  ISNULL(c.CAAnnee, 0) <> ISNULL(r.SommeR1, 0);
+SET @n = @@ROWCOUNT;
+
+INSERT INTO #Resultats (Test, Libelle, Anomalies)
+VALUES (N'4', N'Somme annuelle de R1 = chiffre d''affaires total de l''année', @n);
+GO
+
+/* =====================================================================
+   Préparation du test 5 (pas un test) : R1, R2, R3 matérialisées dans
+   les deux modèles, avec la même logique que 05_requetes.sql (sans les
+   colonnes d'affichage).
    ===================================================================== */
 IF OBJECT_ID('tempdb..#R1_tdw')  IS NOT NULL DROP TABLE #R1_tdw;
 IF OBJECT_ID('tempdb..#R1_scd2') IS NOT NULL DROP TABLE #R1_scd2;
@@ -203,63 +247,45 @@ GROUP BY a.ProductSubcategoryKey;
 GO
 
 /* =====================================================================
-   Test 4 — Pour chaque année, la somme des lignes de R1 (TDW) est égale
-   au chiffre d'affaires total de l'année. Un oubli de la condition
-   temporelle compterait certaines ventes deux fois ; une vente sans
-   sous-catégorie valide disparaîtrait.
+   Test 5 — R1, R2 et R3 donnent exactement le même résultat dans les
+   deux modèles, vérifié dans les deux sens avec EXCEPT.
+   Attendu : 0 ligne pour chacune des requêtes 5a, 5b, 5c.
    ===================================================================== */
-WITH TotalR1 AS (
-    SELECT Annee, SUM(ChiffreAffaires) AS SommeR1 FROM #R1_tdw GROUP BY Annee
-),
-TotalAnnee AS (
-    SELECT d.CalendarYear AS Annee, SUM(f.SalesAmount) AS CAAnnee
-    FROM   dbo.FactResellerSales AS f
-    JOIN   dbo.DimDate AS d ON d.DateKey = f.OrderDateKey
-    GROUP BY d.CalendarYear
-)
-SELECT t.Annee, t.CAAnnee, r.SommeR1,
-       t.CAAnnee - ISNULL(r.SommeR1, 0) AS Ecart
-INTO   #Test4
-FROM   TotalAnnee AS t
-LEFT JOIN TotalR1 AS r ON r.Annee = t.Annee;
 
-SELECT N'Test 4' AS Test, * FROM #Test4 ORDER BY Annee;
-
+/* Test 5a — R1. Attendu : 0 ligne. */
+DECLARE @n INT;
+SELECT N'TDW sans SCD 2' AS Sens, * FROM (SELECT * FROM #R1_tdw  EXCEPT SELECT * FROM #R1_scd2) AS a
+UNION ALL
+SELECT N'SCD 2 sans TDW',         * FROM (SELECT * FROM #R1_scd2 EXCEPT SELECT * FROM #R1_tdw)  AS b;
+SET @n = @@ROWCOUNT;
 INSERT INTO #Resultats (Test, Libelle, Anomalies)
-SELECT N'4', N'Somme annuelle de R1 = chiffre d''affaires total de l''année', COUNT(*)
-FROM   #Test4 WHERE Ecart <> 0;
+VALUES (N'5a', N'R1 identique dans TDW et SCD 2 (EXCEPT dans les deux sens)', @n);
 
-DROP TABLE #Test4;
+/* Test 5b — R2. Attendu : 0 ligne. */
+SELECT N'TDW sans SCD 2' AS Sens, * FROM (SELECT * FROM #R2_tdw  EXCEPT SELECT * FROM #R2_scd2) AS a
+UNION ALL
+SELECT N'SCD 2 sans TDW',         * FROM (SELECT * FROM #R2_scd2 EXCEPT SELECT * FROM #R2_tdw)  AS b;
+SET @n = @@ROWCOUNT;
+INSERT INTO #Resultats (Test, Libelle, Anomalies)
+VALUES (N'5b', N'R2 identique dans TDW et SCD 2 (EXCEPT dans les deux sens)', @n);
+
+/* Test 5c — R3. Attendu : 0 ligne. */
+SELECT N'TDW sans SCD 2' AS Sens, * FROM (SELECT * FROM #R3_tdw  EXCEPT SELECT * FROM #R3_scd2) AS a
+UNION ALL
+SELECT N'SCD 2 sans TDW',         * FROM (SELECT * FROM #R3_scd2 EXCEPT SELECT * FROM #R3_tdw)  AS b;
+SET @n = @@ROWCOUNT;
+INSERT INTO #Resultats (Test, Libelle, Anomalies)
+VALUES (N'5c', N'R3 identique dans TDW et SCD 2 (EXCEPT dans les deux sens)', @n);
 GO
 
 /* =====================================================================
-   Test 5 — R1, R2 et R3 donnent exactement le même résultat dans les
-   deux modèles. Vérifié dans les deux sens avec EXCEPT :
-   (TDW EXCEPT SCD2) et (SCD2 EXCEPT TDW) doivent être vides.
+   Contrôle de sens (pas un test de la consigne) : R1 et R2 doivent
+   DIFFÉRER, sinon le scénario n'a rien changé.
+   Attendu : 4 lignes différentes (Jerseys 2010, 2011, 2012 ; Vests 2012).
    ===================================================================== */
-SELECT N'R1' AS Requete, N'TDW sans SCD2' AS Sens, * INTO #Diff5 FROM (SELECT * FROM #R1_tdw  EXCEPT SELECT * FROM #R1_scd2) AS x;
-INSERT INTO #Diff5 SELECT N'R1', N'SCD2 sans TDW', * FROM (SELECT * FROM #R1_scd2 EXCEPT SELECT * FROM #R1_tdw)  AS x;
-INSERT INTO #Diff5 SELECT N'R2', N'TDW sans SCD2', * FROM (SELECT * FROM #R2_tdw  EXCEPT SELECT * FROM #R2_scd2) AS x;
-INSERT INTO #Diff5 SELECT N'R2', N'SCD2 sans TDW', * FROM (SELECT * FROM #R2_scd2 EXCEPT SELECT * FROM #R2_tdw)  AS x;
-
-SELECT N'R3' AS Requete, N'TDW sans SCD2' AS Sens, * INTO #Diff5R3 FROM (SELECT * FROM #R3_tdw  EXCEPT SELECT * FROM #R3_scd2) AS x;
-INSERT INTO #Diff5R3 SELECT N'R3', N'SCD2 sans TDW', * FROM (SELECT * FROM #R3_scd2 EXCEPT SELECT * FROM #R3_tdw)  AS x;
-
-IF EXISTS (SELECT 1 FROM #Diff5)   SELECT N'Test 5 — écarts R1/R2' AS Test, * FROM #Diff5;
-IF EXISTS (SELECT 1 FROM #Diff5R3) SELECT N'Test 5 — écarts R3'    AS Test, * FROM #Diff5R3;
-
-INSERT INTO #Resultats (Test, Libelle, Anomalies)
-SELECT N'5-R1', N'R1 identique dans TDW et SCD 2 (EXCEPT dans les deux sens)', COUNT(*) FROM #Diff5 WHERE Requete = N'R1';
-INSERT INTO #Resultats (Test, Libelle, Anomalies)
-SELECT N'5-R2', N'R2 identique dans TDW et SCD 2 (EXCEPT dans les deux sens)', COUNT(*) FROM #Diff5 WHERE Requete = N'R2';
-INSERT INTO #Resultats (Test, Libelle, Anomalies)
-SELECT N'5-R3', N'R3 identique dans TDW et SCD 2 (EXCEPT dans les deux sens)', COUNT(*) FROM #Diff5R3;
-
-/* Contrôle de sens : R1 et R2 doivent DIFFÉRER (sinon le scénario n'a rien changé) */
 SELECT N'Contrôle' AS Test, COUNT(*) AS LignesDifferentesR1R2
 FROM  (SELECT * FROM #R1_tdw EXCEPT SELECT * FROM #R2_tdw) AS x;
 
-DROP TABLE #Diff5; DROP TABLE #Diff5R3;
 DROP TABLE #R1_tdw; DROP TABLE #R1_scd2; DROP TABLE #R2_tdw;
 DROP TABLE #R2_scd2; DROP TABLE #R3_tdw; DROP TABLE #R3_scd2;
 GO

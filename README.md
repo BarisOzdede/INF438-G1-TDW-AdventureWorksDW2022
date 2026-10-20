@@ -141,9 +141,11 @@ tables temporelles sont petites.
 
 ### Tests (`07`)
 
-Les 7 contrôles renvoient **OK** : 1 (faits identiques à la source), 2 (aucun chevauchement),
-3 (synchronisation), 4 (somme annuelle de R1 = CA de l'année), 5-R1, 5-R2, 5-R3 (EXCEPT dans les deux
-sens). Contrôle de sens : R1 et R2 diffèrent sur exactement 4 lignes.
+Une requête par test : le test 1 renvoie une égalité vérifiée (`OK`), les tests 2, 3, 4, 5a, 5b et 5c
+renvoient **zéro ligne**. Tests : 1 (faits identiques à la source), 2 (aucun chevauchement),
+3 (synchronisation), 4 (somme annuelle de R1 = CA de l'année), 5a, 5b, 5c (R1, R2, R3 identiques dans
+les deux modèles, EXCEPT dans les deux sens). Le récapitulatif final affiche 7 × OK.
+Contrôle de sens : R1 et R2 diffèrent sur exactement 4 lignes.
 
 ### Bonus (`05`)
 
