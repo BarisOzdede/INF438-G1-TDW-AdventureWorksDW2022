@@ -262,3 +262,221 @@ WHERE  u.FromDate <= d.FullDateAlternateKey
 GROUP BY e.EmployeKey, e.Prenom, e.Nom
 ORDER BY Superviseur;
 GO
+
+/* #####################################################################
+   BONUS (facultatif) — R6, R7, R8
+   ##################################################################### */
+
+/* =====================================================================
+   Fonctions dbo.MaxDate / dbo.MinDate (requête 3, p. 137)
+   L'article les utilise sans les définir. GREATEST / LEAST n'existent
+   qu'à partir de SQL Server 2022 ; ces fonctions rendent le script
+   compatible avec SQL Server 2016+ (et Azure SQL Edge).
+   (Ce ne sont pas des tables : la règle « ne pas modifier dbo » est
+   respectée.)
+   ===================================================================== */
+CREATE OR ALTER FUNCTION dbo.MaxDate (@a DATE, @b DATE)
+RETURNS DATE
+AS
+BEGIN
+    RETURN CASE WHEN @a >= @b THEN @a ELSE @b END;
+END;
+GO
+
+CREATE OR ALTER FUNCTION dbo.MinDate (@a DATE, @b DATE)
+RETURNS DATE
+AS
+BEGIN
+    RETURN CASE WHEN @a <= @b THEN @a ELSE @b END;
+END;
+GO
+
+/* =====================================================================
+   R6 — Union temporelle et coalescing (requête 6, p. 139)
+   Chiffre d'affaires des produits qui, à la date de la vente,
+   appartenaient à Jerseys ou à Vests.
+
+   Pour les 3 produits déplacés à @t1, les périodes « Jerseys »
+   [1900, @t1) et « Vests » [@t1, 9999) se touchent : le coalescing les
+   fusionne en une seule période. Contrairement à R5, le coalescing ne
+   change pas le total ici (les périodes sont disjointes) ; il évite de
+   présenter artificiellement deux périodes pour un même produit.
+   ===================================================================== */
+DECLARE @scJerseys INT = (SELECT ProductSubcategoryKey FROM dbo.DimProductSubcategory
+                          WHERE EnglishProductSubcategoryName = N'Jerseys');
+DECLARE @scVests   INT = (SELECT ProductSubcategoryKey FROM dbo.DimProductSubcategory
+                          WHERE EnglishProductSubcategoryName = N'Vests');
+
+WITH JerseysOuVests AS (          -- union temporelle des deux affectations
+    SELECT ProduitKey, FromDate, ToDate
+    FROM   tdw.ProduitSousCategorie
+    WHERE  ProductSubcategoryKey IN (@scJerseys, @scVests)
+),
+Marques AS (
+    SELECT ProduitKey, FromDate, ToDate,
+           CASE WHEN FromDate <= MAX(ToDate) OVER (
+                         PARTITION BY ProduitKey ORDER BY FromDate, ToDate
+                         ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
+                THEN 0 ELSE 1 END AS NouveauGroupe
+    FROM   JerseysOuVests
+),
+Groupes AS (
+    SELECT *, SUM(NouveauGroupe) OVER (
+                  PARTITION BY ProduitKey ORDER BY FromDate, ToDate
+                  ROWS UNBOUNDED PRECEDING) AS Groupe
+    FROM   Marques
+),
+JerseysOuVestsCoalesces AS (
+    SELECT ProduitKey, MIN(FromDate) AS FromDate, MAX(ToDate) AS ToDate
+    FROM   Groupes
+    GROUP BY ProduitKey, Groupe
+)
+SELECT pr.ProduitKey, pr.ProductAlternateKey, pr.NomProduit,
+       c.FromDate, c.ToDate,
+       SUM(v.SalesAmount) AS ChiffreAffaires,
+       COUNT(*)           AS NbLignes
+FROM   JerseysOuVestsCoalesces AS c
+JOIN   tdw.Produit AS pr ON pr.ProduitKey = c.ProduitKey
+JOIN   tdw.Ventes  AS v  ON v.ProduitKey  = c.ProduitKey
+JOIN   dbo.DimDate AS d  ON d.DateKey     = v.OrderDateKey
+WHERE  c.FromDate <= d.FullDateAlternateKey
+  AND  d.FullDateAlternateKey < c.ToDate
+GROUP BY pr.ProduitKey, pr.ProductAlternateKey, pr.NomProduit, c.FromDate, c.ToDate
+ORDER BY pr.ProductAlternateKey, c.FromDate;
+
+/* R6 — contrôle : avec et sans coalescing, même total, nombre de périodes différent */
+SELECT N'Sans coalescing' AS Variante,
+       COUNT(DISTINCT CONCAT(ps.ProduitKey, N'|', ps.FromDate)) AS NbPeriodes,
+       SUM(v.SalesAmount) AS ChiffreAffaires
+FROM   tdw.ProduitSousCategorie AS ps
+JOIN   tdw.Ventes  AS v ON v.ProduitKey = ps.ProduitKey
+JOIN   dbo.DimDate AS d ON d.DateKey = v.OrderDateKey
+WHERE  ps.ProductSubcategoryKey IN (@scJerseys, @scVests)
+  AND  ps.FromDate <= d.FullDateAlternateKey AND d.FullDateAlternateKey < ps.ToDate;
+GO
+
+/* =====================================================================
+   R7 — Roll-up récursif (requête 3, p. 136-137)
+   Pour une année donnée, ventes personnelles d'un employé et ventes
+   cumulées avec ses subordonnés (directs et indirects).
+
+   L'article laisse le roll-up récursif aux travaux futurs (p. 141) et
+   le simule par une requête récursive. Supervision = fermeture
+   transitive TEMPORELLE de EmployeSupervision : la paire
+   (employé, supérieur indirect) n'est valide que sur l'intersection
+   des intervalles des maillons (dbo.MaxDate / dbo.MinDate).
+
+   Écart volontaire avec l'article : FULL OUTER JOIN entre ventes
+   personnelles et ventes des subordonnés, pour inclure les managers
+   sans ventes personnelles (sinon ils disparaissent du résultat).
+   Année 2012 : elle contient @t4 (changement de superviseur).
+   ===================================================================== */
+DECLARE @annee INT = 2012;
+
+WITH Supervision AS (
+    SELECT EmployeKey, SuperviseurKey, FromDate, ToDate, 1 AS Niveau
+    FROM   tdw.EmployeSupervision
+    UNION ALL
+    SELECT s.EmployeKey, e.SuperviseurKey,
+           dbo.MaxDate(s.FromDate, e.FromDate),
+           dbo.MinDate(s.ToDate,   e.ToDate),
+           s.Niveau + 1
+    FROM   Supervision AS s
+    JOIN   tdw.EmployeSupervision AS e ON e.EmployeKey = s.SuperviseurKey
+    WHERE  dbo.MaxDate(s.FromDate, e.FromDate) < dbo.MinDate(s.ToDate, e.ToDate)
+),
+VentesAnnee AS (
+    SELECT v.EmployeKey, d.FullDateAlternateKey AS DateVente, v.SalesAmount
+    FROM   tdw.Ventes AS v
+    JOIN   dbo.DimDate AS d ON d.DateKey = v.OrderDateKey
+    WHERE  d.CalendarYear = @annee
+),
+VentesPerso AS (
+    SELECT EmployeKey, SUM(SalesAmount) AS Montant
+    FROM   VentesAnnee
+    GROUP BY EmployeKey
+),
+VentesSubordonnes AS (            -- roll-up temporellement cohérent : supérieur valide à la date de la vente
+    SELECT s.SuperviseurKey AS EmployeKey, SUM(va.SalesAmount) AS Montant
+    FROM   VentesAnnee AS va
+    JOIN   Supervision AS s
+           ON  s.EmployeKey = va.EmployeKey
+           AND s.FromDate <= va.DateVente
+           AND va.DateVente < s.ToDate
+    GROUP BY s.SuperviseurKey
+)
+SELECT e.EmployeKey,
+       e.Prenom + N' ' + e.Nom                          AS Employe,
+       ISNULL(p.Montant, 0)                             AS VentesPersonnelles,
+       ISNULL(p.Montant, 0) + ISNULL(s.Montant, 0)      AS VentesAvecSubordonnes
+FROM   VentesPerso AS p
+FULL OUTER JOIN VentesSubordonnes AS s ON s.EmployeKey = p.EmployeKey
+JOIN   tdw.Employe AS e ON e.EmployeKey = COALESCE(p.EmployeKey, s.EmployeKey)
+ORDER BY VentesAvecSubordonnes DESC
+OPTION (MAXRECURSION 100);
+
+/* R7 — contrôle : le sommet de la hiérarchie doit cumuler tout le CA de l'année */
+SELECT @annee AS Annee,
+       (SELECT SUM(v.SalesAmount) FROM tdw.Ventes AS v
+        JOIN dbo.DimDate AS d ON d.DateKey = v.OrderDateKey
+        WHERE d.CalendarYear = @annee) AS CATotalAnnee;
+GO
+
+/* =====================================================================
+   R8 — Drill-across (Définition 16)
+   Ventes aux revendeurs et ventes Internet (FactInternetSales) par
+   produit et par mois.
+
+   Les deux faits sont d'abord agrégés séparément au même grain
+   (produit stable, année, mois), puis rapprochés : joindre avant
+   d'agréger multiplierait les lignes. FactInternetSales pointe vers des
+   VERSIONS de produit (SCD 2) : on remonte au produit stable par
+   ProductAlternateKey, comme pour tdw.Ventes (C3).
+
+   La Définition 16 est une équijointure (cellules présentes dans les
+   deux faits) ; on utilise ici un FULL OUTER JOIN pour ne perdre aucune
+   vente, et le contrôle ci-dessous donne le nombre de cellules communes.
+   ===================================================================== */
+WITH Revendeurs AS (
+    SELECT v.ProduitKey, d.CalendarYear AS Annee, d.MonthNumberOfYear AS Mois,
+           SUM(v.SalesAmount) AS CARevendeurs
+    FROM   tdw.Ventes AS v
+    JOIN   dbo.DimDate AS d ON d.DateKey = v.OrderDateKey
+    GROUP BY v.ProduitKey, d.CalendarYear, d.MonthNumberOfYear
+),
+Internet AS (
+    SELECT pr.ProduitKey, d.CalendarYear AS Annee, d.MonthNumberOfYear AS Mois,
+           SUM(f.SalesAmount) AS CAInternet
+    FROM   dbo.FactInternetSales AS f
+    JOIN   dbo.DimProduct AS p  ON p.ProductKey = f.ProductKey
+    JOIN   tdw.Produit    AS pr ON pr.ProductAlternateKey = p.ProductAlternateKey
+    JOIN   dbo.DimDate    AS d  ON d.DateKey = f.OrderDateKey
+    GROUP BY pr.ProduitKey, d.CalendarYear, d.MonthNumberOfYear
+)
+SELECT COALESCE(r.ProduitKey, i.ProduitKey) AS ProduitKey,
+       pr.NomProduit,
+       COALESCE(r.Annee, i.Annee)           AS Annee,
+       COALESCE(r.Mois,  i.Mois)            AS Mois,
+       ISNULL(r.CARevendeurs, 0)            AS CARevendeurs,
+       ISNULL(i.CAInternet,   0)            AS CAInternet
+INTO   #R8
+FROM   Revendeurs AS r
+FULL OUTER JOIN Internet AS i
+       ON  i.ProduitKey = r.ProduitKey AND i.Annee = r.Annee AND i.Mois = r.Mois
+JOIN   tdw.Produit AS pr ON pr.ProduitKey = COALESCE(r.ProduitKey, i.ProduitKey);
+
+SELECT * FROM #R8 ORDER BY Annee, Mois, ProduitKey;
+
+/* R8 — contrôle : totaux conservés et répartition des cellules */
+SELECT COUNT(*)                                               AS NbCellules,
+       SUM(CASE WHEN CARevendeurs > 0 AND CAInternet > 0 THEN 1 ELSE 0 END) AS CellulesCommunes,
+       SUM(CASE WHEN CAInternet = 0 THEN 1 ELSE 0 END)        AS RevendeursSeuls,
+       SUM(CASE WHEN CARevendeurs = 0 THEN 1 ELSE 0 END)      AS InternetSeul,
+       SUM(CARevendeurs)                                      AS TotalRevendeurs,
+       (SELECT SUM(SalesAmount) FROM dbo.FactResellerSales)   AS TotalSourceRevendeurs,
+       SUM(CAInternet)                                        AS TotalInternet,
+       (SELECT SUM(SalesAmount) FROM dbo.FactInternetSales)   AS TotalSourceInternet
+FROM   #R8;
+
+DROP TABLE #R8;
+GO
